@@ -1,0 +1,74 @@
+{
+  "small_topology": {
+    "size": 20,
+    "baseline_objective": 8309.814571385283,
+    "results": {
+      "greedy": {
+        "objective_value": 63693.126365273136,
+        "duration_seconds": 0.03511840000282973,
+        "iterations": 4,
+        "violations_count": 0
+      },
+      "spectral": {
+        "objective_value": 30808.80045562997,
+        "duration_seconds": 2.2036155000023427,
+        "iterations": 1,
+        "violations_count": 0
+      },
+      "sa": {
+        "objective_value": 30808.80045562997,
+        "duration_seconds": 0.1675835999994888,
+        "iterations": 221,
+        "violations_count": 0
+      }
+    }
+  },
+  "medium_topology": {
+    "size": 50,
+    "baseline_objective": -15683.468583881651,
+    "results": {
+      "greedy": {
+        "objective_value": 457515.8596568417,
+        "duration_seconds": 0.6371511999968789,
+        "iterations": 6,
+        "violations_count": 0
+      },
+      "spectral": {
+        "objective_value": 49476.157223492366,
+        "duration_seconds": 0.04285959999833722,
+        "iterations": 1,
+        "violations_count": 0
+      },
+      "sa": {
+        "objective_value": 55103.73864964972,
+        "duration_seconds": 0.9150778999974136,
+        "iterations": 221,
+        "violations_count": 0
+      }
+    }
+  },
+  "large_topology": {
+    "size": 100,
+    "baseline_objective": -663554.8748832799,
+    "results": {
+      "greedy": {
+        "objective_value": 2182438.070281553,
+        "duration_seconds": 4.880134300001373,
+        "iterations": 8,
+        "violations_count": 0
+      },
+      "spectral": {
+        "objective_value": -649261.5645191837,
+        "duration_seconds": 0.07604079999873647,
+        "iterations": 1,
+        "violations_count": 0
+      },
+      "sa": {
+        "objective_value": -208400.48885862273,
+        "duration_seconds": 3.209847300000547,
+        "iterations": 221,
+        "violations_count": 0
+      }
+    }
+  }
+}

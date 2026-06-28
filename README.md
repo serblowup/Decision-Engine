@@ -1,0 +1,488 @@
+﻿# Decision Engine (AVLAN-2026)
+
+Decision Engine опрашивает VictoriaMetrics по расписанию, извлекает агрегированные NetFlow-метрики по VLAN, читает актуальное состояние сети из PostgreSQL, принимает решения о реконфигурации и публикует `ReconfigurationTask` в Kafka (`reconfig.tasks`).
+
+## Data Flow
+
+| Source | Direction | Format |
+|---|---|---|
+| VictoriaMetrics | poll | PromQL `/prometheus/api/v1/query` и `/prometheus/api/v1/query_range` |
+| PostgreSQL | read | `network_device`, `vlan`, `device_interface`, `interface_vlan`, `trunk_allowed_vlan`, `device_vlan`, `reconfiguration_task_status` |
+| Kafka `reconfig.tasks` | produce | JSON `ReconfigurationTask` |
+
+## State Machine
+
+Decision Engine работает как двухсостоянийный автомат.
+
+**IDLE** — основной режим работы:
+- читает топологию сети из PostgreSQL
+- получает метрики из VictoriaMetrics
+- запускает стратегию
+- если стратегия решила действовать → публикует таску в Kafka → переходит в WAITING
+- если NO_ACTION → ждёт следующий цикл (METRICS_POLL_INTERVAL_SEC)
+
+**WAITING** — ожидание результата реконфигурации:
+- новые таски НЕ публикуются (дедупликация)
+- слушает LISTEN/NOTIFY на канале `reconfiguration_task_status_changed` (ускоритель)
+- polling таблицы `reconfiguration_task_status` каждые 10 секунд (baseline)
+- при получении терминального статуса всех batch → переходит в IDLE
+- при превышении DEDUP_WAITING_TIMEOUT_SEC → сверяет топологию → переходит в IDLE
+
+Терминальные статусы batch: `SUCCESS`, `FAILED`, `ROLLED_BACK`, `CANCEL`
+
+После перехода в IDLE из WAITING:
+- перечитывает свежую топологию из PostgreSQL
+- классифицирует результат: applied / not_applied / partial / unknown
+
+## PostgreSQL Schema Notes
+
+Decision Engine читает следующие таблицы:
+- `network_device`
+- `vlan`
+- `device_interface`
+- `interface_vlan`
+- `trunk_allowed_vlan`
+- `device_vlan` — какие VLAN сконфигурированы на конкретном устройстве
+- `reconfiguration_task_status` — статусы выполнения задач (для WAITING состояния)
+
+Прямой таблицы `vlan_assignments` нет. Слой `src/db/network_state.py` собирает `NetworkState.assignments` через `JOIN`:
+- ACCESS: `interface_vlan.access_vlan_id`
+- TRUNK: `trunk_allowed_vlan.vlan_id`
+
+Идентификаторы устройств (`network_device.id`, `device_interface.id`) — `UUID`.
+
+Таблица `device_vlan (device_id, vlan_id)` используется для per-device
+проверки наличия VLAN перед добавлением ADD_VLAN в таску.
+TaskBuilder добавляет ADD_VLAN только если VLAN отсутствует на конкретном
+устройстве согласно этой таблице.
+
+Таблица `reconfiguration_task_status (task_id, batch_id, status)` используется
+в состоянии WAITING для отслеживания прогресса выполнения задачи Configurator-ом.
+
+## VLAN Resolution
+
+`VictoriaMetricsClient` определяет VLAN из метрик NetFlow v9.
+Поддерживается только один уровень — `vlan_id` как тег.
+Уровни subnet mapping и SNMP mapping отключены до принятия
+решения о поддержке NetFlow v5.
+
+| Level | Method | Condition |
+|---|---|---|
+| 1 | `vlan_id` tag | Метрика `netflow_bytes` содержит тег `vlan_id != "0"` |
+| 2 | none | Пустой список и WARNING лог |
+
+PromQL запрос для уровня 1:
+
+```promql
+sum by (vlan_id) (
+    rate(netflow_bytes{vlan_id!="0", direction="0"}[2m])
+)
+```
+
+### VLAN_RESOLUTION_METHOD
+
+| Value | Behavior |
+|---|---|
+| `auto` | Уровень 1 (vlan_id tag), при пустом результате — WARNING |
+| `tag` | Только уровень 1, идентично auto |
+
+## Expected Metrics (VictoriaMetrics)
+
+| Metric | Key Tags | Description |
+|---|---|---|
+| `netflow_bytes` | `vlan_id`, `vlan_src`, `vlan_dst`, `direction`, `src`, `dst`, `exporter`, `input_if`, `output_if` | Байты потока NetFlow v9. Основная метрика для агрегации по VLAN |
+| `netflow_packets` | те же теги что у `netflow_bytes` | Пакеты потока |
+| `netflow_flow_count` | те же теги что у `netflow_bytes` | Количество flows |
+| `netflow_flow_end_msec` | те же теги что у `netflow_bytes` | Время окончания flow в миллисекундах |
+| `netflow_flow_start_msec` | те же теги что у `netflow_bytes` | Время начала flow в миллисекундах |
+| `netflow_tos` | те же теги что у `netflow_bytes` | Type of Service |
+| `netflow_in_bytes` | `db`, `host`, `source`, `version` | Bytes от Telegraf netflow plugin (raw, без vlan тега) |
+| `netflow_in_packets` | `db`, `host`, `source`, `version` | Packets от Telegraf netflow plugin (raw) |
+| `netflow_in_snmp` | `db`, `host`, `source`, `version` | ifIndex входящего интерфейса (raw) |
+| `netflow_vlan_src` | `db`, `host`, `source`, `version` | VLAN источника как значение метрики (raw Telegraf) |
+| `netflow_vlan_dst` | `db`, `host`, `source`, `version` | VLAN назначения как значение метрики (raw Telegraf) |
+
+Метрики `netflow_bytes`, `netflow_packets`, `netflow_flow_count` и связанные
+с суффиксом `_msec` и `tos` — это обогащённый формат NetFlow v9 с VLAN
+тегами непосредственно в labels. Decision Engine использует только их.
+
+Метрики `netflow_in_bytes`, `netflow_in_packets` и прочие с префиксом
+`netflow_in_` или `netflow_vlan_` — raw формат Telegraf без VLAN тегов.
+Decision Engine их не использует напрямую.
+
+## Trigger Thresholds (defaults)
+
+| Setting | Default | Meaning | Justification |
+|---|---|---|---|
+| `ANOMALY_THRESHOLD` | `3.0` | Z-score порог аномалии | 3-sigma: вероятность случайного превышения < 0.3% |
+| `BANDWIDTH_THRESHOLD` | `0.85` | Порог утилизации линка | 85% — инженерный стандарт, выше начинается конгестия |
+| `ICMP_THRESHOLD` | `1000.0` | ICMP пакет/сек | Граница между диагностикой (< 100) и flood/scan (> 1000) |
+| `NEW_SOURCES_THRESHOLD` | `10` | Новых уникальных IP за период | 10 новых источников за 5 минут аномально для малой сети |
+| `INTER_VLAN_RATIO_THRESHOLD` | `0.4` | Доля межсегментного трафика | 40%+ межсегментного → признак lateral movement |
+| `MAX_FLOW_BYTES_THRESHOLD` | `100000000` | Байт в одном потоке | 100 MB один поток → возможная утечка данных |
+| `LINK_CAPACITY_MBPS` | `1000` | Пропускная способность линка | Физический 1GbE линк стенда |
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `KAFKA_BOOTSTRAP` | `kafka:9092` | Kafka bootstrap servers |
+| `KAFKA_TASKS_TOPIC` | `reconfig.tasks` | Выходной топик задач |
+| `KAFKA_RESULTS_TOPIC` | `results.reconfig` | Резервный топик результатов |
+| `VICTORIAMETRICS_URL` | `http://victoriametrics:8428` | URL VictoriaMetrics |
+| `METRICS_POLL_INTERVAL_SEC` | `60` | Интервал polling метрик |
+| `VLAN_RESOLUTION_METHOD` | `auto` | Метод резолвинга VLAN (`auto|tag`) |
+| `POSTGRES_DSN` | `postgresql+asyncpg://postgres:postgres@postgres/admin_panel` | DSN PostgreSQL |
+| `ANOMALY_THRESHOLD` | `3.0` | Порог anomaly_score |
+| `BANDWIDTH_THRESHOLD` | `0.85` | Порог utilization |
+| `ICMP_THRESHOLD` | `1000.0` | Порог ICMP интенсивности |
+| `NEW_SOURCES_THRESHOLD` | `10` | Порог скачка active sources |
+| `INTER_VLAN_RATIO_THRESHOLD` | `0.4` | Порог межсегментного ratio |
+| `MERGE_MIN_INTER_VLAN_BYTES_PER_SEC` | `1000000.0` | Минимальный абсолютный межсегментный трафик (bytes/sec) для MERGE; защита от цикла merge на шумном ratio при простаивающем VLAN |
+| `MAX_FLOW_BYTES_THRESHOLD` | `100000000` | Порог максимального потока |
+| `LINK_CAPACITY_MBPS` | `1000` | Линк в Mbps |
+| `SEGMENTER_TYPE` | `greedy` | Алгоритм оптимизации: `greedy`, `spectral`, `sa` |
+| `GREEDY_MAX_ITERATIONS` | `100` | Максимум итераций greedy |
+| `LAMBDA_COEFF` | `0.5` | Коэффициент ? |
+| `SA_INITIAL_TEMPERATURE` | `100.0` | Начальная температура SA |
+| `SA_COOLING_RATE` | `0.95` | Cooling rate SA |
+| `SA_MAX_ITERATIONS` | `1000` | Максимум итераций SA |
+| `QUARANTINE_VLAN` | `999` | VLAN карантина |
+| `FALLBACK_VLAN_ID` | `1` | VLAN, куда эвакуируются access-порты при DELETE_VLAN |
+| `SUBINTERFACE_PARENT` | `GigabitEthernet0/0/1` | Родительский интерфейс для subinterface |
+| `SUBINTERFACE_SUBNET_TEMPLATE` | `192.168.{vlan_id}.1/24` | Шаблон IP адреса subinterface |
+| `SUBINTERFACE_ENABLED` | `true` | Включить автоматическое управление subinterface |
+| `KAFKA_BOOTSTRAP_MARKER_ENABLED` | `true` | Публиковать bootstrap маркер при старте producer |
+| `DEDUP_WAITING_TIMEOUT_SEC` | `600` | Таймаут ожидания результата от Configurator (секунды) |
+| `LOG_LEVEL` | `INFO` | Уровень логирования |
+
+## Run with Docker Compose
+
+```bash
+docker compose -f docker-compose.dev.yml up --build
+```
+
+## Local Mock Metrics (without Telegraf)
+
+```bash
+python scripts/mock_metrics_writer.py --mode tag
+python scripts/mock_metrics_writer.py --mode subnet
+python scripts/mock_metrics_writer.py --mode snmp
+```
+
+Скрипт напрямую пишет Prometheus-совместимые метрики в VictoriaMetrics (`/api/v1/import/prometheus`) каждые 60 секунд.
+Это только локальная dev-заглушка до готовности реального Collector и не часть production-архитектуры.
+
+## Action Contract (Strict)
+
+Ниже зафиксирован жесткий контракт `Action` для `reconfig.tasks`.
+Configurator должен ориентироваться только на эти поля.
+
+### Allowed `action_type`
+
+- `ADD_VLAN`
+- `DELETE_VLAN`
+- `SET_ACCESS`
+- `SET_TRUNK` — перевод порта ACCESS → TRUNK (смена режима)
+- `EDIT_TRUNK` — изменение allowed-list на уже-trunk порту (режим не меняется)
+- `SWITCH_VLAN`
+- `CREATE_SUBINTERFACE`
+- `DELETE_SUBINTERFACE`
+
+### Common Fields
+
+Каждый action содержит:
+
+```json
+{
+  "id": "uuid",
+  "device_id": "uuid",
+  "action_type": "string",
+  "params": {},
+  "previous_state": {},
+  "target_state": {},
+  "status": "PENDING|EXECUTING|SUCCESS|FAILED|ROLLED_BACK"
+}
+```
+
+### Per-Action Schema
+
+1. `ADD_VLAN`
+
+```json
+{
+  "action_type": "ADD_VLAN",
+  "params": {
+    "vlan_id": 999
+  }
+}
+```
+
+`previous_state` и `target_state` допускаются пустыми.
+
+2. `DELETE_VLAN`
+
+```json
+{
+  "action_type": "DELETE_VLAN",
+  "params": {
+    "vlan_id": 30
+  }
+}
+```
+
+`previous_state` и `target_state` допускаются пустыми.
+
+3. `SET_ACCESS`
+
+```json
+{
+  "action_type": "SET_ACCESS",
+  "params": {
+    "port": "GigabitEthernet0/2",
+    "vlan_id": 20
+  },
+  "previous_state": {
+    "mode": "TRUNK",
+    "allowed_vlans": [10, 20, 30]
+  },
+  "target_state": {
+    "mode": "ACCESS",
+    "vlan_id": 20
+  }
+}
+```
+
+Примечание: previous_state.mode берётся из PostgreSQL (interface_vlan.mode)
+на момент построения задачи. Значение может быть ACCESS или TRUNK.
+allowed_vlans заполняется из trunk_allowed_vlan если mode=TRUNK, иначе пустой список.
+
+4. `SET_TRUNK`
+
+```json
+{
+  "action_type": "SET_TRUNK",
+  "params": {
+    "port": "GigabitEthernet0/24",
+    "allowed_vlans": [10, 20, 30],
+    "native_vlan_id": 1
+  },
+  "previous_state": {
+    "mode": "ACCESS",
+    "vlan_id": 10
+  },
+  "target_state": {
+    "mode": "TRUNK",
+    "allowed_vlans": [10, 20, 30],
+    "native_vlan_id": 1
+  }
+}
+```
+
+Примечание: native_vlan_id опциональный, если отсутствует Configurator использует свой дефолт.
+
+DE эмитит `SET_TRUNK` ТОЛЬКО когда `previous_state.mode == ACCESS` — это перевод
+порта из ACCESS в TRUNK. Контракт (поля на проводе: `port` + `allowed_vlans`) не
+изменился, обработчик `SET_TRUNK` в Configurator остаётся прежним.
+
+4a. `EDIT_TRUNK` (новый)
+
+```json
+{
+  "action_type": "EDIT_TRUNK",
+  "params": {
+    "port": "GigabitEthernet0/24",
+    "allowed_vlans": [10, 20, 30]
+  },
+  "previous_state": {
+    "allowed_vlans": [10, 20]
+  },
+  "target_state": {
+    "allowed_vlans": [10, 20, 30]
+  }
+}
+```
+
+`EDIT_TRUNK` эмитится, когда порт УЖЕ trunk и меняется только allowed-list. Режим
+у `EDIT_TRUNK` НЕ передаётся (порт по определению уже TRUNK с обеих сторон линка),
+поэтому в `previous_state`/`target_state` остаётся только `allowed_vlans`:
+`previous_state.allowed_vlans` — старый список (для отката), `target_state` — новый.
+CM-обработчик должен строиться под эту финальную форму (без `mode`) и применять
+`switchport trunk allowed vlan <target>` без смены режима порта. (Реализация
+CM-обработчика координируется с командой Configurator отдельно.)
+
+5. `SWITCH_VLAN`
+
+```json
+{
+  "action_type": "SWITCH_VLAN",
+  "params": {
+    "port": "GigabitEthernet0/1",
+    "target_vlan_id": 999
+  },
+  "previous_state": {
+    "vlan_id": 20
+  },
+  "target_state": {
+    "vlan_id": 999
+  }
+}
+```
+
+6. `CREATE_SUBINTERFACE`
+
+```json
+{
+  "action_type": "CREATE_SUBINTERFACE",
+  "params": {
+    "parent_interface": "GigabitEthernet0/0/1",
+    "vlan_id": 30,
+    "ip_address": "192.168.30.1/24"
+  }
+}
+```
+
+7. `DELETE_SUBINTERFACE`
+
+```json
+{
+  "action_type": "DELETE_SUBINTERFACE",
+  "params": {
+    "parent_interface": "GigabitEthernet0/0/1",
+    "vlan_id": 30
+  }
+}
+```
+
+### Decision Mapping
+
+ISOLATE и MERGE не отправляются как отдельные action_type.
+Стратегия принимает решение, TaskBuilder раскрывает его в базовые actions.
+
+Правило subinterface:
+- `ADD_VLAN` всегда тянет `CREATE_SUBINTERFACE` (если `SUBINTERFACE_ENABLED=true` и найден роутер).
+- `DELETE_VLAN` всегда тянет `DELETE_SUBINTERFACE` (если subinterface найдена в PostgreSQL).
+
+#### ISOLATE (изоляция порта в карантинный VLAN)
+
+Решение стратегии: перевести порт GigabitEthernet0/1 из VLAN 20 в VLAN 999.
+
+Генерируемые actions (один batch, одно устройство):
+
+1. Если VLAN 999 не существует на устройстве согласно `device_vlan`:
+   ADD_VLAN { params: { vlan_id: 999 } }
+   CREATE_SUBINTERFACE { params: { parent_interface: "GigabitEthernet0/0/1", vlan_id: 999, ip_address: "192.168.999.1/24" } }
+
+2. SWITCH_VLAN {
+     params: { port: "GigabitEthernet0/1", target_vlan_id: 999 },
+     previous_state: { vlan_id: 20 },
+     target_state: { vlan_id: 999 }
+   }
+
+Если изолируемый VLAN присутствует на нескольких устройствах —
+создаётся отдельный batch на каждое устройство, все выполняются параллельно.
+
+#### MERGE (слияние двух VLAN)
+
+Решение стратегии: поглотить source VLAN в target VLAN.
+
+- `source_vlan` — VLAN из `decision.vlan_id` (поглощаемый)
+- `target_vlan` — VLAN с наибольшим числом портов среди остальных
+
+Генерируемые actions:
+
+Batch на каждое устройство (параллельно):
+Для каждого порта из source_vlan:
+SWITCH_VLAN port → target_vlan
+
+Финальный batch:
+DELETE_SUBINTERFACE source_vlan (если subinterface найден в device_interface)
+DELETE_VLAN source_vlan
+
+Правила защиты:
+- target_vlan никогда не удаляется
+- DELETE_VLAN не добавляется если source_vlan оказался target для другого merge
+- DELETE_VLAN не добавляется если VLAN отсутствует на роутере в device_vlan
+
+### Topology-aware раскрытие ADD_VLAN / DELETE_VLAN
+
+`ADD_VLAN(device, vlan)` и `DELETE_VLAN(device, vlan)` — это логические операции.
+TaskBuilder раскрывает их в полный согласованный набор actions с учётом физической
+топологии: недостаточно добавить VLAN в базу устройства — VLAN должен быть разрешён
+на транках по пути между всеми членами VLAN, а при удалении снят с этих транков и со
+всех access-портов.
+
+Топология строится один раз на цикл как граф (`src/task_builder/topology.py`):
+узлы — устройства, рёбра — физические линки (`link` ↔ пары интерфейсов из
+`device_interface`). Набор транков, обязанных нести VLAN, вычисляется как
+Steiner-дерево членов VLAN (объединение кратчайших путей; точное минимальное дерево
+на дереве топологии, корректное приближение на меше), а не «все транки подряд».
+
+Данные топологии:
+
+```
+link(interface_a_id, interface_b_id)        смежность интерфейсов (неориентированная)
+device_interface(id, device_id, ...)        интерфейс принадлежит устройству
+interface_vlan(interface, mode, access_vlan_id)   ACCESS|TRUNK, access VLAN
+trunk_allowed_vlan(interface, vlan_id)       текущий allowed-list транка
+device_vlan(device_id, vlan_id)              члены VLAN (какие устройства)
+endpoint_network_attachment(...)            порт смотрит в хост
+```
+
+**ADD_VLAN(D, V)** — `members_after = device_vlan(V) ∪ {D}`, `needed_links =
+steiner_links(members_after)`. Порядок batch:
+
+```
+[ADD_VLAN(D,V)]  →  [SET_TRUNK пары]  →  [SET_ACCESS]
+```
+
+На каждом линке из `needed_links` VLAN добавляется в allowed-list ОБОИХ концов
+(парно). Если других членов V нет (`members_after = {D}`) — транки не трогаются,
+только `ADD_VLAN(D,V)` и access-порты.
+
+**DELETE_VLAN(D, V)** — НЕ симметрично ADD. `members_after = device_vlan(V) \ {D}`.
+Порядок batch:
+
+```
+[SET_ACCESS эвакуация]  →  [SET_TRUNK снятие пары]  →  [DELETE_VLAN]
+```
+
+1. Access-порты D в V всегда и первыми эвакуируются в `FALLBACK_VLAN_ID`.
+2. Если D — транзит для оставшихся членов (через D идёт путь между членами,
+   т.е. D присутствует в `needed_links`): VLAN сохраняется, выполняется только
+   эвакуация access, `SET_TRUNK` снятие и `DELETE_VLAN` НЕ эмитятся (WARNING в лог).
+3. Иначе (D — лист/изолирован по V): VLAN снимается с allowed-list транк-портов D и
+   с парных портов соседей, затем `DELETE_VLAN` из базы устройства. Снятие у соседа
+   не удаляет VLAN из его базы — только из allowed-list этого порта.
+
+Guard'ы и идемпотентность:
+- `SET_TRUNK` только на портах `mode == TRUNK`. Меж-свитчевый порт в ACCESS —
+  пропуск + WARNING (рассинхрон топологии), без «починки».
+- VLAN не добавляется, если уже в allowed-list; не снимается, если отсутствует.
+- При отсутствии данных топологии (нет `topology_getter`) — legacy-поведение:
+  одиночный `ADD_VLAN` / `DELETE_VLAN` без транковой логики.
+
+Точка инъекции топологии — конструктор `TaskBuilder(topology_getter=...)`,
+по аналогии с `router_device_id_getter` / `router_subinterfaces_getter`.
+
+## Deduplication
+
+Decision Engine публикует не более одной активной задачи в Kafka одновременно.
+
+Механизм: state machine IDLE/WAITING.
+Пока задача находится в обработке у Configurator (статус IN_PROGRESS),
+DE находится в состоянии WAITING и не публикует новые задачи.
+
+Переход из WAITING в IDLE происходит когда:
+- все batch задачи получили терминальный статус в `reconfiguration_task_status`
+- или истёк таймаут `DEDUP_WAITING_TIMEOUT_SEC` (дефолт: 600 сек)
+
+После таймаута DE перечитывает топологию из PostgreSQL и сравнивает
+фактическое состояние с ожидаемым перед принятием следующего решения.
+
+## Run Tests Locally
+
+```bash
+pip install -e .
+pytest
+```

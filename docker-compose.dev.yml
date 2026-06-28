@@ -1,0 +1,78 @@
+services:
+  decision-engine:
+    build:
+      context: .
+    environment:
+      KAFKA_BOOTSTRAP: ${KAFKA_BOOTSTRAP:-kafka:9092}
+      KAFKA_TASKS_TOPIC: ${KAFKA_TASKS_TOPIC:-reconfig.tasks}
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql+asyncpg://user:pass@postgres/avlan}
+      VICTORIAMETRICS_URL: ${VICTORIAMETRICS_URL:-http://victoriametrics:8428}
+      METRICS_POLL_INTERVAL_SEC: ${METRICS_POLL_INTERVAL_SEC:-60}
+      ANOMALY_THRESHOLD: ${ANOMALY_THRESHOLD:-3.0}
+      BANDWIDTH_THRESHOLD: ${BANDWIDTH_THRESHOLD:-0.85}
+      TRIGGER_CHANGE_PERCENT: ${TRIGGER_CHANGE_PERCENT:-0.2}
+      PERIODIC_INTERVAL_SECONDS: ${PERIODIC_INTERVAL_SECONDS:-60}
+      SEGMENTER_TYPE: ${SEGMENTER_TYPE:-greedy}
+      GREEDY_MAX_ITERATIONS: ${GREEDY_MAX_ITERATIONS:-100}
+      LAMBDA_COEFF: ${LAMBDA_COEFF:-0.5}
+      SA_INITIAL_TEMPERATURE: ${SA_INITIAL_TEMPERATURE:-100.0}
+      SA_COOLING_RATE: ${SA_COOLING_RATE:-0.95}
+      SA_MAX_ITERATIONS: ${SA_MAX_ITERATIONS:-1000}
+      QUARANTINE_VLAN: ${QUARANTINE_VLAN:-999}
+      SUBINTERFACE_PARENT: "GigabitEthernet0/0/1"
+      SUBINTERFACE_SUBNET_TEMPLATE: "192.168.{vlan_id}.1/24"
+      SUBINTERFACE_ENABLED: "true"
+      LINK_CAPACITY_MBPS: ${LINK_CAPACITY_MBPS:-1000}
+      ICMP_THRESHOLD: ${ICMP_THRESHOLD:-1000.0}
+      NEW_SOURCES_THRESHOLD: ${NEW_SOURCES_THRESHOLD:-10}
+      INTER_VLAN_RATIO_THRESHOLD: ${INTER_VLAN_RATIO_THRESHOLD:-0.4}
+      MAX_FLOW_BYTES_THRESHOLD: ${MAX_FLOW_BYTES_THRESHOLD:-100000000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      victoriametrics:
+        condition: service_started
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 1
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    ports:
+      - "9092:9092"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: avlan
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d avlan"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5432:5432"
+
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:latest
+    command: ["-retentionPeriod=7d"]
+    ports:
+      - "8428:8428"

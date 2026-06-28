@@ -1,0 +1,5 @@
+echo ".venv/" >> .gitignore
+echo ".idea/" >> .gitignore
+echo ".coverage" >> .gitignore
+echo "__pycache__/" >> .gitignore
+echo "*.pyc" >> .gitignore
