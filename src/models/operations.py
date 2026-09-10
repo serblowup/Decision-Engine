@@ -16,6 +16,10 @@ class ActionType(StrEnum):
     SWITCH_VLAN = "SWITCH_VLAN"
     CREATE_SUBINTERFACE = "CREATE_SUBINTERFACE"
     DELETE_SUBINTERFACE = "DELETE_SUBINTERFACE"
+    # IPAM actions
+    SPLIT_VLAN = "SPLIT_VLAN"              # Логическое действие: разбить VLAN на два
+    MERGE_VLAN = "MERGE_VLAN"              # Логическое действие: слить два VLAN
+    UPDATE_VLAN_PREFIX = "UPDATE_VLAN_PREFIX"  # Обновить префикс VLAN в БД
 
 
 class ActionStatus(StrEnum):

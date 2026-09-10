@@ -30,10 +30,12 @@ class VlanInfo(BaseModel):
     name: str | None
     admin_status: str
     oper_status: str | None
-    # Set by Gateway via vlan.is_protected. A protected VLAN must never be the
-    # target of a destructive DE action (DELETE_VLAN, trunk removal) nor have its
-    # placement changed. NULL is treated as not protected.
     is_protected: bool | None = None
+    # IPAM поля
+    ip_prefix: str | None = None  # CIDR формат, например "192.168.10.0/24"
+    gateway_ip: str | None = None
+    dhcp_scope_start: str | None = None
+    dhcp_scope_end: str | None = None
 
 
 class VlanAssignment(BaseModel):
@@ -48,7 +50,5 @@ class NetworkState(BaseModel):
     vlans: list[VlanInfo]
     assignments: list[VlanAssignment]
     device_vlans: set[tuple[UUID, int]] = Field(default_factory=set)
-    # VLANs flagged vlan.is_protected = TRUE. Single source of truth shared with
-    # the strategies and task_builder; refreshed every decision cycle.
     protected_vlans: set[int] = Field(default_factory=set)
     timestamp: datetime
